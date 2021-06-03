@@ -32,8 +32,8 @@ use pallet_transaction_payment::Config as PaymentConfig;
 pub type Balance = u128;
 
 pub const KEY_TYPE: KeyTypeId = KeyTypeId(*b"abcd");
-
-pub const HTTP_REMOTE_REQUEST: &str = "https://horizon-testnet.stellar.org/accounts/GAIMY7QQDWDQLX3KH6KFR25JLRJS4VGXFKLTRK66MPI6VPU3YDOPS6KQ/transactions?order=desc&limit=1";
+pub const ESCROW_ACCOUNT: &str = "GAIMY7QQDWDQLX3KH6KFR25JLRJS4VGXFKLTRK66MPI6VPU3YDOPS6KQ";
+pub const HTTP_REMOTE_REQUEST: &str = format!("https://horizon-testnet.stellar.org/accounts/{}/transactions?order=desc&limit=1", ESCROW_ACCOUNT);
 pub const FETCH_TIMEOUT_PERIOD: u64 = 3000; // in milli-seconds
 
 const UNSIGNED_TXS_PRIORITY: u64 = 100;
