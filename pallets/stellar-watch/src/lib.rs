@@ -8,7 +8,6 @@ use frame_support::{
     debug, decl_error, decl_event, decl_module, decl_storage, dispatch::DispatchResult,
 };
 use parity_scale_codec::{Decode, Encode};
-
 use substrate_stellar_xdr::{xdr, xdr_codec::XdrCodec};
 
 use substrate_stellar_sdk::keypair::PublicKey as StellarPublicKey;
@@ -35,9 +34,9 @@ use serde::{Deserialize, Deserializer};
 use string::String;
 
 use pallet_balances::{Config as BalancesConfig, Pallet as BalancesPallet};
-use pallet_transaction_payment::Config as PaymentConfig;
+use pallet_assets::{Config as AssetsConfig};
 
-pub type Balance = u128;
+use pallet_transaction_payment::Config as PaymentConfig;
 
 pub const KEY_TYPE: KeyTypeId = KeyTypeId(*b"abcd");
 
@@ -130,7 +129,7 @@ pub struct Payload<AccountId, Public, Balance> {
     signed_by: Public,
 }
 
-impl<T: SigningTypes> SignedPayload<T> for Payload<T::AccountId, T::Public, T::Balance>
+impl<T: SigningTypes> SignedPayload<T> for Payload<T::AccountId, T::Public, <T as pallet_balances::Config>::Balance>
 where
     T: BalancesConfig,
 {
@@ -152,23 +151,23 @@ where
 
 /// This is the pallet's configuration trait
 pub trait Config:
-    frame_system::Config + CreateSignedTransaction<Call<Self>> + BalancesConfig + PaymentConfig
+    frame_system::Config + CreateSignedTransaction<Call<Self>> +
+        BalancesConfig<Balance = u64> + PaymentConfig + AssetsConfig
 {
     type AuthorityId: AppCrypto<Self::Public, Self::Signature>;
     /// The overarching dispatch call type.
     type Call: From<Call<Self>>;
     /// The overarching event type.
     type Event: From<Event<Self>> + Into<<Self as frame_system::Config>::Event>;
-
     type GatewayEscrowAccount: Get<&'static str>;
     type GatewayMockedAmount: Get<<Self as pallet_balances::Config>::Balance>;
     type GatewayMockedDestination: Get<<Self as frame_system::Config>::AccountId>;
+    type StellarAsset: ;
 }
 
 decl_storage! {
     trait Store for Module<T: Config> as Call {
-        /// A vector of recently submitted numbers. Bounded by NUM_VEC_LEN
-        Numbers get(fn numbers): VecDeque<u64>;
+        Signers get(fn signers): VecDeque<T::AccountId>;
     }
 }
 
@@ -209,13 +208,10 @@ decl_module! {
         fn deposit_event() = default;
 
         #[weight = 10000]
-        pub fn submit_deposit_unsigned_with_signed_payload(origin, payload: Payload<T::AccountId, T::Public, T::Balance>,
+        pub fn submit_deposit_unsigned_with_signed_payload(origin, payload: Payload<T::AccountId, T::Public, <T as pallet_balances::Config>::Balance>,
             _signature: T::Signature) -> DispatchResult
         {
             let _ = ensure_none(origin)?;
-            // FIXME: Verify signature
-            // ~~we don't need to verify the signature here because it has been verified in
-            //   `validate_unsigned` function when sending out the unsigned tx.~~
             let Payload { deposit, destination, signed_by } = payload;
             debug::info!("submit_deposit_unsigned_with_signed_payload: ({:?}, {:?}, {:?})", deposit, destination, signed_by);
 
@@ -249,54 +245,71 @@ decl_module! {
                 }
             });
 
-            // The result of `mutate` call will give us a nested `Result` type.
-            // The first one matches the return of the closure passed to `mutate`, i.e.
-            // if we return `Err` from the closure, we get an `Err` here.
-            // In case we return `Ok`, here we will have another (inner) `Result` that indicates
-            // if the value has been set to the storage correctly - i.e. if it wasn't
-            // written to in the meantime.
             match res {
                 // The value has been set correctly.
                 Ok(Ok(saved_tx_id)) => {
                     if !initial {
-                        debug::info!("✴️  New transaction from Horizon (id {:#?}). Starting to replicate transaction in Pendulum.", str::from_utf8(&saved_tx_id).unwrap());
+                        debug::info!("✴️  New transaction from Horizon (id {:#?}).
+                            Starting to replicate transaction in Pendulum.", str::from_utf8(&saved_tx_id).unwrap());
 
                         // Decode transaction to Base64 and then to Stellar XDR to get transaction details
                         let tx_xdr = base64::decode(&tx.envelope_xdr).unwrap();
                         let tx_envelope = xdr::TransactionEnvelope::from_xdr(&tx_xdr).unwrap();
+                        
+                        let mut asset_code: Option<<T as pallet_assets::Config>::AssetId>;
+                        let mut amount: Option<<T as pallet_balances::Config>::Balance>;
+                        let mut destination: Option<T::AccountId>;
 
                         if let xdr::TransactionEnvelope::EnvelopeTypeTx(env) = tx_envelope {
 
                             // Source account will be our destination account
                             if let xdr::MuxedAccount::KeyTypeEd25519(key) = env.tx.source_account {
                                 let pubkey = StellarPublicKey::from_binary(key).to_encoding();
-                                debug::info!("Escrow account {:?}", str::from_utf8(&pubkey).unwrap());
+                                match str::from_utf8(&pubkey) {
+                                    Ok(stellar_account_id) => debug::info!("✔️  Source account is a valid Stellar account {:?}", stellar_account_id),
+                                    Err(_err) => debug::error!("❌  Source account is a not a valid Stellar account.")
+                                }
                             }
 
                             for op in env.tx.operations.get_vec() {
-                                let asset_code;
-                                let amount: f64;
-                                
                                 if let xdr::OperationBody::Payment(payment_op) = &op.body {
-                                    // TODO: optional, double check destination is the escrow account
-                                    if let xdr::MuxedAccount::KeyTypeEd25519(dest) = payment_op.destination {
-                                        let pubkey = StellarPublicKey::from_binary(dest).to_encoding();
-                                        debug::info!("Escrow account {:?}", str::from_utf8(&pubkey).unwrap());
+
+                                    let dest_account = xdr::MuxedAccount::from(payment_op.destination.clone());
+                                    debug::info!("Muxed account {:#?}", dest_account);
+
+                                    if let xdr::MuxedAccount::KeyTypeEd25519(dest_unwrapped) = payment_op.destination {
+                                        let pubkey = StellarPublicKey::from_binary(dest_unwrapped).to_encoding();
+                                        let pubkey_str = str::from_utf8(&pubkey).unwrap();
+                                        if pubkey_str.eq(T::GatewayEscrowAccount::get()) {
+                                        // This wont compile because dest_unwrapped is of type [u8; 32] 
+                                        // and destination is defined as an Option of AccountId (conversion layer missing)
+                                        destination = Some(dest_unwrapped);
+                                            debug::info!("✔️  Destination account is the escrow account {:?}", pubkey_str);
+                                        }
                                     }
+                                    
+                                    let asset = xdr::Asset::from(payment_op.asset.clone());
+                                    debug::info!("XDR Asset {:#?}", asset);
+
+                                    let a: <T as pallet_assets::Config>::AssetId;
+                                    
                                     if let xdr::Asset::AssetTypeCreditAlphanum4(code) = &payment_op.asset {
-                                        asset_code = str::from_utf8(&code.asset_code).unwrap_or("Invalid asset code.");
+                                        // This wont compile because code.asset_code is of type str
+                                        // and asset_code is defined as an Option of AssetId (conversion layer missing)
+                                        asset_code = str::from_utf8(&code.asset_code).ok();
                                         debug::info!("Asset {:#?}", asset_code);
-                                        amount = (payment_op.amount as f64) / 10000000.0;
+                                        amount = Some(payment_op.amount as u64);
                                         debug::info!("Amount {:#?}", amount);
                                     }
                                 }
                             }
                         }
 
-                        let amount = T::GatewayMockedAmount::get();
-                        let destination = T::GatewayMockedDestination::get();
-
-                        Self::offchain_unsigned_tx_signed_payload(amount, destination).unwrap();
+                        if asset_code.is_some() && amount.is_some() && destination.is_some() {
+                            // Wont compile because of mismatched types here also
+                            // TODO: Add asset: AssetId as a parameter of this function
+                            Self::offchain_unsigned_tx_signed_payload(amount.unwrap(), destination.unwrap()).unwrap();
+                        }
                     }
                 },
                 // The transaction id is the same as before.
@@ -361,7 +374,7 @@ impl<T: Config> Module<T> {
     }
 
     fn offchain_unsigned_tx_signed_payload(
-        deposit: T::Balance,
+        deposit: <T as pallet_balances::Config>::Balance,
         destination: T::AccountId,
     ) -> Result<(), Error<T>> {
         // Retrieve the signer to sign the payload
